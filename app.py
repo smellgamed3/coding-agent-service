@@ -7,7 +7,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
-from typing import Optional
+from typing import Literal, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -26,6 +26,12 @@ WORKSPACE = "/workspace"
 RUN_SCRIPT = "/tmp/run.sh"
 EXIT_CODE_FILE = "/tmp/agent_exit_code"
 MAX_COMMIT_SUMMARY_LENGTH = 72
+
+# 各 CLI 工具在自动模式下使用的命令行标志
+_CLI_AUTO_FLAGS: dict[str, str] = {
+    "claude-code": "--yes",
+    "opencode": "--yes",
+}
 
 # ---------------------------------------------------------------------------
 # In-memory state
@@ -88,6 +94,7 @@ class TaskRequest(BaseModel):
     task: str
     auto_mode: bool = True
     mcp_servers: Optional[dict[str, McpServerConfig]] = None
+    cli_tool: Literal["claude-code", "opencode"] = "claude-code"
 
 
 # ---------------------------------------------------------------------------
@@ -132,12 +139,13 @@ def _generate_run_script(
     branch: str,
     task: str,
     auto_mode: bool,
+    cli_tool: str = "claude-code",
 ) -> str:
     """Return the shell script content that performs the coding task."""
     quoted_task = shlex.quote(task)
     quoted_branch = shlex.quote(branch)
     quoted_url = shlex.quote(repo_url)
-    cli_flag = "--yes" if auto_mode else ""
+    cli_flag = _CLI_AUTO_FLAGS[cli_tool] if auto_mode else ""
     task_summary = task.replace('"', "'")[:MAX_COMMIT_SUMMARY_LENGTH]
     quoted_summary = shlex.quote(f"agent: {task_summary}")
 
@@ -148,7 +156,7 @@ rm -rf {shlex.quote(WORKSPACE)} && mkdir -p {shlex.quote(WORKSPACE)}
 git clone --branch {quoted_branch} {quoted_url} {shlex.quote(WORKSPACE)}
 cd {shlex.quote(WORKSPACE)}
 
-claude-code {cli_flag} {quoted_task}
+{cli_tool} {cli_flag} {quoted_task}
 
 git add -A
 git diff --cached --quiet || git commit -m {quoted_summary}
@@ -198,7 +206,7 @@ async def submit_task(req: TaskRequest):
     task_exit_code = None
 
     clone_url = _build_authenticated_url(req.repo_url, req.repo_token)
-    script_content = _generate_run_script(clone_url, req.branch, req.task, req.auto_mode)
+    script_content = _generate_run_script(clone_url, req.branch, req.task, req.auto_mode, req.cli_tool)
 
     with open(RUN_SCRIPT, "w") as f:
         f.write(script_content)

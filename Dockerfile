@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---------------------------------------------------------------------------
 # Install CLI tools (claude-code / opencode via npm)
 # ---------------------------------------------------------------------------
-RUN npm install -g @anthropic-ai/claude-code 2>/dev/null || true
+RUN npm install -g @anthropic-ai/claude-code opencode 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Python dependencies
