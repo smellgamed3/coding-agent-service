@@ -2,7 +2,10 @@
 
 import json
 import os
+import shlex
+import stat
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -38,6 +41,39 @@ class TestBuildAuthenticatedUrl(unittest.TestCase):
         token = "mytoken123"
         result = agent_app._build_authenticated_url(url, token)
         self.assertEqual(result, url)
+
+    def test_url_with_existing_credentials_is_not_modified(self):
+        """已含凭据的 URL 不应被再次嵌入 Token（防止 Token 意外拼接或暴露）"""
+        url = "https://user:pass@github.com/org/repo"
+        token = "newtoken"
+        result = agent_app._build_authenticated_url(url, token)
+        self.assertEqual(result, url)
+
+    def test_url_with_at_sign_in_host_is_not_modified(self):
+        """含 @ 的 URL（可能用于劫持 Token 至第三方）应原样返回，不嵌入 Token"""
+        # 恶意 URL：oauth2:token 会被发送到 evil.com，而非 github.com
+        url = "https://evil.com@github.com/org/repo"
+        token = "secret"
+        result = agent_app._build_authenticated_url(url, token)
+        # @ 出现在 netloc 中，urllib.parse 将 evil.com 识别为 username，应原样返回
+        self.assertEqual(result, url)
+        # 确保 Token 未出现在返回值中
+        self.assertNotIn(token, result)
+
+    def test_https_url_with_port_embeds_token_correctly(self):
+        """带端口号的 HTTPS URL 应正确嵌入 Token"""
+        url = "https://gitlab.example.com:8443/org/repo"
+        token = "mytoken"
+        result = agent_app._build_authenticated_url(url, token)
+        self.assertEqual(result, "https://oauth2:mytoken@gitlab.example.com:8443/org/repo")
+
+    def test_invalid_url_without_hostname_returns_original(self):
+        """hostname 解析失败的无效 URL 应原样返回，不嵌入 Token"""
+        url = "https://"
+        token = "secret"
+        result = agent_app._build_authenticated_url(url, token)
+        self.assertEqual(result, url)
+        self.assertNotIn(token, result)
 
 
 class TestGenerateRunScript(unittest.TestCase):
@@ -122,7 +158,6 @@ class TestGenerateRunScript(unittest.TestCase):
         # shlex.quote 将整个参数包裹在单引号内，防止 shell 展开
         # 验证 claude-code 存在且参数是经过 shlex.quote 处理后的字符串
         self.assertIn("claude-code", script)
-        import shlex
         # shlex.quote 后的结果应出现在脚本中（单引号包裹，内部单引号用 '"'"' 转义）
         quoted_task = shlex.quote(task)
         self.assertIn(quoted_task, script)
@@ -132,6 +167,20 @@ class TestGenerateRunScript(unittest.TestCase):
             "https://github.com/org/repo", "feature/my-branch", "task", True
         )
         self.assertIn("feature/my-branch", script)
+
+    def test_invalid_cli_tool_raises_value_error(self):
+        """不支持的 cli_tool 应抛出 ValueError，防止 shell 注入"""
+        with self.assertRaises(ValueError):
+            agent_app._generate_run_script(
+                "https://github.com/org/repo", "main", "task", False, "malicious; rm -rf /"
+            )
+
+    def test_invalid_cli_tool_auto_mode_raises_value_error(self):
+        """auto_mode=True 时不支持的 cli_tool 同样应抛出 ValueError"""
+        with self.assertRaises(ValueError):
+            agent_app._generate_run_script(
+                "https://github.com/org/repo", "main", "task", True, "unknown-tool"
+            )
 
 
 class TestGetStatus(unittest.TestCase):
@@ -195,7 +244,6 @@ class TestWriteMcpConfig(unittest.TestCase):
     """测试 _write_mcp_config 函数"""
 
     def test_writes_mcp_servers_to_settings(self):
-        import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             settings_path = os.path.join(tmpdir, "settings.json")
             with patch("os.path.expanduser", return_value=tmpdir):
@@ -223,6 +271,20 @@ class TestWriteMcpConfig(unittest.TestCase):
                         data["mcpServers"]["my-server"]["url"],
                         "https://mcp.example.com",
                     )
+
+    def test_mcp_settings_file_has_restricted_permissions(self):
+        """MCP 配置文件应设置为 0o600，防止其他用户读取含 Token 的内容"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("os.path.expanduser", return_value=tmpdir):
+                config = {
+                    "srv": agent_app.McpServerConfig(
+                        url="https://mcp.example.com", token="secret_token"
+                    )
+                }
+                agent_app._write_mcp_config(config)
+            settings_path = os.path.join(tmpdir, "settings.json")
+            file_mode = stat.S_IMODE(os.stat(settings_path).st_mode)
+            self.assertEqual(file_mode, 0o600, "MCP 配置文件权限应为 0o600（仅所有者可读写）")
 
 
 class TestMcpServerConfigModel(unittest.TestCase):
@@ -383,6 +445,24 @@ class TestApiSubmitTask(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         mock_gen.assert_called_once()
         self.assertIn("claude-code", mock_gen.call_args.args + tuple(mock_gen.call_args.kwargs.values()))
+
+    def test_submit_task_run_script_has_restricted_permissions(self):
+        """运行脚本应设置为 0o700，防止其他用户读取含认证 Token 的内容"""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".sh") as tmp:
+            tmp_path = tmp.name
+        try:
+            with patch.object(agent_app, "_get_status", return_value="IDLE"), \
+                 patch("subprocess.run"), \
+                 patch.object(agent_app, "RUN_SCRIPT", tmp_path), \
+                 patch("os.path.isfile", return_value=False), \
+                 patch.object(agent_app, "_kill_session"), \
+                 patch("asyncio.create_task"):
+                resp = self.client.post("/task", json=self._valid_payload())
+            self.assertEqual(resp.status_code, 200)
+            file_mode = stat.S_IMODE(os.stat(tmp_path).st_mode)
+            self.assertEqual(file_mode, 0o700, "脚本文件权限应为 0o700（仅所有者可读写执行）")
+        finally:
+            os.unlink(tmp_path)
 
 
 class TestApiGetTask(unittest.TestCase):

@@ -7,6 +7,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import urllib.parse
 from typing import Literal, Optional
 
 import uvicorn
@@ -106,8 +107,18 @@ def _build_authenticated_url(repo_url: str, repo_token: Optional[str]) -> str:
     if not repo_token:
         return repo_url
     if repo_url.startswith("https://"):
-        rest = repo_url[len("https://"):]
-        return f"https://oauth2:{repo_token}@{rest}"
+        parsed = urllib.parse.urlparse(repo_url)
+        # 拒绝已包含凭据的 URL，防止攻击者通过 @ 字符将 Token 劫持到第三方服务器
+        if parsed.username or parsed.password:
+            return repo_url
+        # 若 hostname 解析失败（无效 URL），则原样返回，不嵌入 Token
+        if not parsed.hostname:
+            return repo_url
+        netloc = f"oauth2:{repo_token}@{parsed.hostname}"
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        authenticated = parsed._replace(netloc=netloc)
+        return urllib.parse.urlunparse(authenticated)
     return repo_url
 
 
@@ -132,6 +143,8 @@ def _write_mcp_config(mcp_servers: dict[str, McpServerConfig]) -> None:
 
     with open(settings_path, "w") as f:
         json.dump(existing, f, indent=2)
+    # 0o600：仅所有者可读写，防止 MCP Server Token 被其他用户读取
+    os.chmod(settings_path, 0o600)
 
 
 def _generate_run_script(
@@ -142,6 +155,10 @@ def _generate_run_script(
     cli_tool: str = "claude-code",
 ) -> str:
     """Return the shell script content that performs the coding task."""
+    if cli_tool not in _CLI_AUTO_FLAGS:
+        raise ValueError(
+            f"不支持的 cli_tool: {cli_tool!r}，必须是以下之一: {list(_CLI_AUTO_FLAGS)}"
+        )
     quoted_task = shlex.quote(task)
     quoted_branch = shlex.quote(branch)
     quoted_url = shlex.quote(repo_url)
@@ -210,7 +227,8 @@ async def submit_task(req: TaskRequest):
 
     with open(RUN_SCRIPT, "w") as f:
         f.write(script_content)
-    os.chmod(RUN_SCRIPT, 0o755)
+    # 0o700：仅所有者可读写执行，防止其他进程读取含认证 Token 的脚本
+    os.chmod(RUN_SCRIPT, 0o700)
 
     if os.path.isfile(EXIT_CODE_FILE):
         os.remove(EXIT_CODE_FILE)
