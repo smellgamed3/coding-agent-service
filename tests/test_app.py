@@ -73,6 +73,32 @@ class TestGenerateRunScript(unittest.TestCase):
         )
         self.assertIn("git push", script)
 
+    def test_cli_tool_defaults_to_claude_code(self):
+        script = agent_app._generate_run_script(
+            "https://github.com/org/repo", "main", "修复 bug", True
+        )
+        self.assertIn("claude-code", script)
+        self.assertNotIn("opencode", script)
+
+    def test_cli_tool_opencode_uses_opencode_command(self):
+        script = agent_app._generate_run_script(
+            "https://github.com/org/repo", "main", "修复 bug", True, "opencode"
+        )
+        self.assertIn("opencode", script)
+        self.assertNotIn("claude-code", script)
+
+    def test_cli_tool_opencode_auto_mode_includes_yes_flag(self):
+        script = agent_app._generate_run_script(
+            "https://github.com/org/repo", "main", "修复 bug", True, "opencode"
+        )
+        self.assertIn("--yes", script)
+
+    def test_cli_tool_opencode_auto_mode_false_excludes_yes_flag(self):
+        script = agent_app._generate_run_script(
+            "https://github.com/org/repo", "main", "修复 bug", False, "opencode"
+        )
+        self.assertNotIn("--yes", script)
+
     def test_task_summary_truncated_to_max_length(self):
         long_task = "A" * 200
         script = agent_app._generate_run_script(
@@ -219,6 +245,31 @@ class TestTaskRequestModel(unittest.TestCase):
         self.assertTrue(req.auto_mode)
         self.assertIsNone(req.repo_token)
         self.assertIsNone(req.mcp_servers)
+        self.assertEqual(req.cli_tool, "claude-code")
+
+    def test_cli_tool_claude_code(self):
+        req = agent_app.TaskRequest(
+            repo_url="https://github.com/org/repo",
+            task="do something",
+            cli_tool="claude-code",
+        )
+        self.assertEqual(req.cli_tool, "claude-code")
+
+    def test_cli_tool_opencode(self):
+        req = agent_app.TaskRequest(
+            repo_url="https://github.com/org/repo",
+            task="do something",
+            cli_tool="opencode",
+        )
+        self.assertEqual(req.cli_tool, "opencode")
+
+    def test_cli_tool_invalid_value_raises_error(self):
+        with self.assertRaises(Exception):
+            agent_app.TaskRequest(
+                repo_url="https://github.com/org/repo",
+                task="do something",
+                cli_tool="unknown-tool",
+            )
 
 
 class TestApiSubmitTask(unittest.TestCase):
@@ -294,6 +345,44 @@ class TestApiSubmitTask(unittest.TestCase):
             resp = self.client.post("/task", json=payload)
         self.assertEqual(resp.status_code, 200)
         mock_write.assert_called_once()
+
+    def test_submit_task_with_opencode_tool(self):
+        payload = dict(self._valid_payload())
+        payload["cli_tool"] = "opencode"
+        with patch.object(agent_app, "_get_status", return_value="IDLE"), \
+             patch("subprocess.run"), \
+             patch("builtins.open", mock_open()), \
+             patch("os.chmod"), \
+             patch("os.path.isfile", return_value=False), \
+             patch.object(agent_app, "_kill_session"), \
+             patch("asyncio.create_task"), \
+             patch.object(agent_app, "_generate_run_script", return_value="#!/bin/bash\n") as mock_gen:
+            resp = self.client.post("/task", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        mock_gen.assert_called_once()
+        # cli_tool 参数应为 "opencode"（可能是位置参数或关键字参数）
+        self.assertIn("opencode", mock_gen.call_args.args + tuple(mock_gen.call_args.kwargs.values()))
+
+    def test_submit_task_with_invalid_cli_tool_returns_422(self):
+        payload = dict(self._valid_payload())
+        payload["cli_tool"] = "invalid-tool"
+        resp = self.client.post("/task", json=payload)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_submit_task_default_cli_tool_is_claude_code(self):
+        payload = dict(self._valid_payload())
+        with patch.object(agent_app, "_get_status", return_value="IDLE"), \
+             patch("subprocess.run"), \
+             patch("builtins.open", mock_open()), \
+             patch("os.chmod"), \
+             patch("os.path.isfile", return_value=False), \
+             patch.object(agent_app, "_kill_session"), \
+             patch("asyncio.create_task"), \
+             patch.object(agent_app, "_generate_run_script", return_value="#!/bin/bash\n") as mock_gen:
+            resp = self.client.post("/task", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        mock_gen.assert_called_once()
+        self.assertIn("claude-code", mock_gen.call_args.args + tuple(mock_gen.call_args.kwargs.values()))
 
 
 class TestApiGetTask(unittest.TestCase):
