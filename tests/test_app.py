@@ -1,11 +1,12 @@
-"""Coding Agent Service 单元测试"""
+"""Coding Agent Service 单元测试与 API 集成测试"""
 
 import json
 import os
 import sys
-import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
+
+from fastapi.testclient import TestClient
 
 # 将项目根目录加入 sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -218,6 +219,225 @@ class TestTaskRequestModel(unittest.TestCase):
         self.assertTrue(req.auto_mode)
         self.assertIsNone(req.repo_token)
         self.assertIsNone(req.mcp_servers)
+
+
+class TestApiSubmitTask(unittest.TestCase):
+    """测试 POST /task 端点"""
+
+    def setUp(self):
+        self.client = TestClient(agent_app.app)
+        # 重置全局状态
+        agent_app.current_token = None
+        agent_app.current_task = None
+        agent_app.task_exit_code = None
+
+    def _valid_payload(self):
+        return {
+            "repo_url": "https://github.com/org/repo",
+            "task": "修复 bug",
+        }
+
+    def test_submit_task_returns_running_status(self):
+        with patch.object(agent_app, "_get_status", return_value="IDLE"), \
+             patch("subprocess.run"), \
+             patch("builtins.open", mock_open()), \
+             patch("os.chmod"), \
+             patch("os.path.isfile", return_value=False), \
+             patch.object(agent_app, "_kill_session"), \
+             patch("asyncio.create_task"):
+            resp = self.client.post("/task", json=self._valid_payload())
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("token", data)
+        self.assertEqual(data["status"], "RUNNING")
+        self.assertIn("ui_url", data)
+
+    def test_submit_task_conflict_when_running(self):
+        with patch.object(agent_app, "_get_status", return_value="RUNNING"):
+            resp = self.client.post("/task", json=self._valid_payload())
+        self.assertEqual(resp.status_code, 409)
+
+    def test_submit_task_ui_url_contains_token(self):
+        with patch.object(agent_app, "_get_status", return_value="IDLE"), \
+             patch("subprocess.run"), \
+             patch("builtins.open", mock_open()), \
+             patch("os.chmod"), \
+             patch("os.path.isfile", return_value=False), \
+             patch.object(agent_app, "_kill_session"), \
+             patch("asyncio.create_task"):
+            resp = self.client.post("/task", json=self._valid_payload())
+        data = resp.json()
+        token = data["token"]
+        self.assertIn(token, data["ui_url"])
+
+    def test_submit_task_missing_required_fields_returns_422(self):
+        resp = self.client.post("/task", json={"repo_url": "https://github.com/org/repo"})
+        self.assertEqual(resp.status_code, 422)
+
+    def test_submit_task_missing_repo_url_returns_422(self):
+        resp = self.client.post("/task", json={"task": "do something"})
+        self.assertEqual(resp.status_code, 422)
+
+    def test_submit_task_with_mcp_servers_calls_write_mcp_config(self):
+        payload = dict(self._valid_payload())
+        payload["mcp_servers"] = {
+            "my-mcp": {"url": "https://mcp.example.com", "token": "tok123"}
+        }
+        with patch.object(agent_app, "_get_status", return_value="IDLE"), \
+             patch("subprocess.run"), \
+             patch("builtins.open", mock_open()), \
+             patch("os.chmod"), \
+             patch("os.path.isfile", return_value=False), \
+             patch.object(agent_app, "_kill_session"), \
+             patch("asyncio.create_task"), \
+             patch.object(agent_app, "_write_mcp_config") as mock_write:
+            resp = self.client.post("/task", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        mock_write.assert_called_once()
+
+
+class TestApiGetTask(unittest.TestCase):
+    """测试 GET /task 端点"""
+
+    def setUp(self):
+        self.client = TestClient(agent_app.app)
+        agent_app.current_token = "valid-token-abc"
+        agent_app.current_task = "测试任务"
+        agent_app.task_exit_code = None
+
+    def tearDown(self):
+        agent_app.current_token = None
+        agent_app.current_task = None
+        agent_app.task_exit_code = None
+
+    def test_get_task_with_valid_token_returns_200(self):
+        with patch.object(agent_app, "_get_status", return_value="RUNNING"):
+            resp = self.client.get("/task?token=valid-token-abc")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "RUNNING")
+        self.assertEqual(data["task"], "测试任务")
+
+    def test_get_task_with_invalid_token_returns_401(self):
+        resp = self.client.get("/task?token=wrong-token")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_get_task_returns_done_status(self):
+        agent_app.task_exit_code = 0
+        with patch.object(agent_app, "_tmux_session_exists", return_value=False):
+            resp = self.client.get("/task?token=valid-token-abc")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "DONE")
+
+    def test_get_task_returns_failed_status(self):
+        agent_app.task_exit_code = 1
+        with patch.object(agent_app, "_tmux_session_exists", return_value=False):
+            resp = self.client.get("/task?token=valid-token-abc")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "FAILED")
+
+
+class TestApiGetUI(unittest.TestCase):
+    """测试 GET /ui 端点"""
+
+    def setUp(self):
+        self.client = TestClient(agent_app.app)
+        agent_app.current_token = "ui-token-xyz"
+        agent_app.current_task = "UI 测试任务"
+
+    def tearDown(self):
+        agent_app.current_token = None
+        agent_app.current_task = None
+
+    def test_get_ui_with_valid_token_returns_html(self):
+        resp = self.client.get("/ui?token=ui-token-xyz")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/html", resp.headers["content-type"])
+        # 验证 token 已注入到 HTML 中（替换 __TOKEN__）
+        self.assertIn("ui-token-xyz", resp.text)
+        self.assertNotIn("__TOKEN__", resp.text)
+
+    def test_get_ui_with_invalid_token_returns_401(self):
+        resp = self.client.get("/ui?token=bad-token")
+        self.assertEqual(resp.status_code, 401)
+
+
+class TestApiCancelTask(unittest.TestCase):
+    """测试 POST /task/cancel 端点"""
+
+    def setUp(self):
+        self.client = TestClient(agent_app.app)
+        agent_app.current_token = "cancel-token"
+        agent_app.current_task = "待取消任务"
+        agent_app.task_exit_code = None
+
+    def tearDown(self):
+        agent_app.current_token = None
+        agent_app.current_task = None
+        agent_app.task_exit_code = None
+
+    def test_cancel_with_valid_token_returns_idle(self):
+        with patch.object(agent_app, "_cleanup"):
+            resp = self.client.post("/task/cancel?token=cancel-token")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "IDLE")
+
+    def test_cancel_clears_global_state(self):
+        with patch.object(agent_app, "_cleanup"):
+            self.client.post("/task/cancel?token=cancel-token")
+        self.assertIsNone(agent_app.current_token)
+        self.assertIsNone(agent_app.current_task)
+        self.assertIsNone(agent_app.task_exit_code)
+
+    def test_cancel_with_invalid_token_returns_401(self):
+        resp = self.client.post("/task/cancel?token=wrong-token")
+        self.assertEqual(resp.status_code, 401)
+
+
+class TestApiDocsEndpoint(unittest.TestCase):
+    """验证 FastAPI 自动生成文档端点可访问"""
+
+    def setUp(self):
+        self.client = TestClient(agent_app.app)
+
+    def test_openapi_docs_available(self):
+        resp = self.client.get("/docs")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_openapi_json_available(self):
+        resp = self.client.get("/openapi.json")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("paths", data)
+        self.assertIn("/task", data["paths"])
+
+
+class TestKillSessionAndCleanup(unittest.TestCase):
+    """测试 _kill_session 和 _cleanup 辅助函数"""
+
+    def test_kill_session_only_when_exists(self):
+        with patch.object(agent_app, "_tmux_session_exists", return_value=False), \
+             patch("subprocess.run") as mock_run:
+            agent_app._kill_session()
+            mock_run.assert_not_called()
+
+    def test_kill_session_runs_tmux_kill(self):
+        with patch.object(agent_app, "_tmux_session_exists", return_value=True), \
+             patch("subprocess.run") as mock_run:
+            agent_app._kill_session()
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            self.assertIn("kill-session", args)
+
+    def test_cleanup_removes_workspace_and_files(self):
+        with patch.object(agent_app, "_kill_session"), \
+             patch("os.path.isdir", return_value=True), \
+             patch("shutil.rmtree") as mock_rmtree, \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.remove") as mock_remove:
+            agent_app._cleanup()
+            mock_rmtree.assert_called_once_with(agent_app.WORKSPACE, ignore_errors=True)
+            self.assertEqual(mock_remove.call_count, 2)
 
 
 if __name__ == "__main__":

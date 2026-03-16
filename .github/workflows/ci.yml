@@ -32,7 +32,7 @@ jobs:
         run: pytest tests/ -v
 
   build:
-    name: Docker 镜像构建
+    name: Docker 镜像构建与验证
     runs-on: ubuntu-latest
     needs: test
     permissions:
@@ -54,7 +54,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: 验证镜像启动
+      - name: 验证镜像启动与 API 健康检查
         run: |
           docker build -t coding-agent-service:ci .
           docker run --rm -d \
@@ -62,7 +62,27 @@ jobs:
             -e ANTHROPIC_API_KEY=test-key \
             --name coding-agent-ci \
             coding-agent-service:ci
-          sleep 3
+          sleep 5
+          # 验证 /docs 端点可访问（HTTP 200）
           curl --retry 5 --retry-delay 2 --retry-connrefused \
             http://localhost:8000/docs -o /dev/null -w "%{http_code}" | grep -q 200
+          # 验证 /openapi.json 可访问并包含 /task 路径
+          curl -sf http://localhost:8000/openapi.json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          if '/task' not in data['paths']:
+              sys.exit('/task 路径未在 OpenAPI 文档中找到')
+          print('OpenAPI 文档验证通过')
+          "
+          # 验证未授权访问返回 422（缺少必填参数）
+          status=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/task \
+            -H "Content-Type: application/json" -d '{}')
+          [ "$status" = "422" ] && echo "参数校验正常（422）" || (echo "期望 422，实际 $status" && exit 1)
+          # 验证 GET /task 未携带 token 返回 422
+          status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/task)
+          [ "$status" = "422" ] && echo "Token 校验正常（422）" || (echo "期望 422，实际 $status" && exit 1)
+          # 验证 GET /task 携带无效 token 返回 401
+          status=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8000/task?token=invalid")
+          [ "$status" = "401" ] && echo "无效 token 校验正常（401）" || (echo "期望 401，实际 $status" && exit 1)
           docker stop coding-agent-ci
+
