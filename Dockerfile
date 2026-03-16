@@ -14,9 +14,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# Install CLI tools (claude-code / opencode via npm)
+# Install claude-code via official installer (npm install is deprecated)
+# See: https://docs.anthropic.com/en/docs/claude-code/setup
 # ---------------------------------------------------------------------------
-RUN npm install -g @anthropic-ai/claude-code opencode 2>/dev/null || true
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Ensure the installer's default bin directory is on PATH for subsequent
+# RUN commands and for the final container runtime.
+ENV PATH="/root/.local/bin:${PATH}"
+
+# ---------------------------------------------------------------------------
+# Install opencode via official npm package (package name: opencode-ai)
+# See: https://www.npmjs.com/package/opencode-ai
+# ---------------------------------------------------------------------------
+RUN npm install -g opencode-ai
 
 # ---------------------------------------------------------------------------
 # Python dependencies
