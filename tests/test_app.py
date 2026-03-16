@@ -1,5 +1,6 @@
 """Coding Agent Service 单元测试与 API 集成测试"""
 
+import asyncio
 import json
 import os
 import shlex
@@ -15,6 +16,19 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import app as agent_app
+
+
+def _close_coro_create_task(coro):
+    """asyncio.create_task 的替代 mock，专用于单元测试场景。
+
+    当使用 patch("asyncio.create_task") 拦截协程调度时，传入的协程对象不会被
+    实际执行或等待，Python 垃圾收集器会检测到未等待的协程并发出
+    "coroutine was never awaited" RuntimeWarning。此函数通过调用 coro.close()
+    主动关闭协程，消除该警告，同时返回一个 MagicMock 以满足调用方对任务对象的
+    后续使用（如 .done()、.cancel() 等方法调用）。
+    """
+    coro.close()
+    return MagicMock()
 
 
 class TestBuildAuthenticatedUrl(unittest.TestCase):
@@ -286,6 +300,41 @@ class TestWriteMcpConfig(unittest.TestCase):
             file_mode = stat.S_IMODE(os.stat(settings_path).st_mode)
             self.assertEqual(file_mode, 0o600, "MCP 配置文件权限应为 0o600（仅所有者可读写）")
 
+    def test_write_mcp_config_merges_with_existing_settings(self):
+        """多次调用 _write_mcp_config 时，新旧服务器配置应合并，不互相覆盖"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("os.path.expanduser", return_value=tmpdir):
+                agent_app._write_mcp_config({
+                    "server1": agent_app.McpServerConfig(url="https://s1.example.com", token="tok1")
+                })
+                agent_app._write_mcp_config({
+                    "server2": agent_app.McpServerConfig(url="https://s2.example.com", token="tok2")
+                })
+            settings_path = os.path.join(tmpdir, "settings.json")
+            with open(settings_path) as f:
+                data = json.load(f)
+        # 两次写入的服务器应同时出现在配置中
+        self.assertIn("server1", data["mcpServers"])
+        self.assertIn("server2", data["mcpServers"])
+        self.assertEqual(data["mcpServers"]["server1"]["url"], "https://s1.example.com")
+        self.assertEqual(data["mcpServers"]["server2"]["url"], "https://s2.example.com")
+
+    def test_write_mcp_config_overwrites_same_server_name(self):
+        """同名服务器配置再次写入时应更新为最新值"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("os.path.expanduser", return_value=tmpdir):
+                agent_app._write_mcp_config({
+                    "srv": agent_app.McpServerConfig(url="https://old.example.com", token="old_tok")
+                })
+                agent_app._write_mcp_config({
+                    "srv": agent_app.McpServerConfig(url="https://new.example.com", token="new_tok")
+                })
+            settings_path = os.path.join(tmpdir, "settings.json")
+            with open(settings_path) as f:
+                data = json.load(f)
+        self.assertEqual(data["mcpServers"]["srv"]["url"], "https://new.example.com")
+        self.assertEqual(data["mcpServers"]["srv"]["token"], "new_tok")
+
 
 class TestMcpServerConfigModel(unittest.TestCase):
     """测试 McpServerConfig 数据模型"""
@@ -357,7 +406,7 @@ class TestApiSubmitTask(unittest.TestCase):
              patch("os.chmod"), \
              patch("os.path.isfile", return_value=False), \
              patch.object(agent_app, "_kill_session"), \
-             patch("asyncio.create_task"):
+             patch("asyncio.create_task", side_effect=_close_coro_create_task):
             resp = self.client.post("/task", json=self._valid_payload())
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -377,7 +426,7 @@ class TestApiSubmitTask(unittest.TestCase):
              patch("os.chmod"), \
              patch("os.path.isfile", return_value=False), \
              patch.object(agent_app, "_kill_session"), \
-             patch("asyncio.create_task"):
+             patch("asyncio.create_task", side_effect=_close_coro_create_task):
             resp = self.client.post("/task", json=self._valid_payload())
         data = resp.json()
         token = data["token"]
@@ -402,7 +451,7 @@ class TestApiSubmitTask(unittest.TestCase):
              patch("os.chmod"), \
              patch("os.path.isfile", return_value=False), \
              patch.object(agent_app, "_kill_session"), \
-             patch("asyncio.create_task"), \
+             patch("asyncio.create_task", side_effect=_close_coro_create_task), \
              patch.object(agent_app, "_write_mcp_config") as mock_write:
             resp = self.client.post("/task", json=payload)
         self.assertEqual(resp.status_code, 200)
@@ -417,7 +466,7 @@ class TestApiSubmitTask(unittest.TestCase):
              patch("os.chmod"), \
              patch("os.path.isfile", return_value=False), \
              patch.object(agent_app, "_kill_session"), \
-             patch("asyncio.create_task"), \
+             patch("asyncio.create_task", side_effect=_close_coro_create_task), \
              patch.object(agent_app, "_generate_run_script", return_value="#!/bin/bash\n") as mock_gen:
             resp = self.client.post("/task", json=payload)
         self.assertEqual(resp.status_code, 200)
@@ -439,7 +488,7 @@ class TestApiSubmitTask(unittest.TestCase):
              patch("os.chmod"), \
              patch("os.path.isfile", return_value=False), \
              patch.object(agent_app, "_kill_session"), \
-             patch("asyncio.create_task"), \
+             patch("asyncio.create_task", side_effect=_close_coro_create_task), \
              patch.object(agent_app, "_generate_run_script", return_value="#!/bin/bash\n") as mock_gen:
             resp = self.client.post("/task", json=payload)
         self.assertEqual(resp.status_code, 200)
@@ -456,7 +505,7 @@ class TestApiSubmitTask(unittest.TestCase):
                  patch.object(agent_app, "RUN_SCRIPT", tmp_path), \
                  patch("os.path.isfile", return_value=False), \
                  patch.object(agent_app, "_kill_session"), \
-                 patch("asyncio.create_task"):
+                 patch("asyncio.create_task", side_effect=_close_coro_create_task):
                 resp = self.client.post("/task", json=self._valid_payload())
             self.assertEqual(resp.status_code, 200)
             file_mode = stat.S_IMODE(os.stat(tmp_path).st_mode)
@@ -490,6 +539,11 @@ class TestApiGetTask(unittest.TestCase):
     def test_get_task_with_invalid_token_returns_401(self):
         resp = self.client.get("/task?token=wrong-token")
         self.assertEqual(resp.status_code, 401)
+
+    def test_get_task_without_token_returns_422(self):
+        """GET /task 未携带 token 参数时，FastAPI 应返回 422（参数缺失）"""
+        resp = self.client.get("/task")
+        self.assertEqual(resp.status_code, 422)
 
     def test_get_task_returns_done_status(self):
         agent_app.task_exit_code = 0
@@ -607,6 +661,97 @@ class TestKillSessionAndCleanup(unittest.TestCase):
             agent_app._cleanup()
             mock_rmtree.assert_called_once_with(agent_app.WORKSPACE, ignore_errors=True)
             self.assertEqual(mock_remove.call_count, 2)
+
+
+class TestMonitorSession(unittest.IsolatedAsyncioTestCase):
+    """测试 _monitor_session 异步函数的退出码处理逻辑"""
+
+    async def test_records_exit_code_zero_from_file(self):
+        """tmux 会话退出后，应从文件读取退出码 0 并设置 task_exit_code = 0"""
+        original_token = agent_app.current_token
+        original_exit = agent_app.task_exit_code
+        try:
+            agent_app.current_token = "test-token"
+            agent_app.task_exit_code = None
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+                f.write("0\n")
+                exit_code_path = f.name
+            try:
+                with patch.object(agent_app, "_tmux_session_exists", return_value=False), \
+                     patch.object(agent_app, "EXIT_CODE_FILE", exit_code_path), \
+                     patch("os.path.isfile", return_value=True):
+                    await agent_app._monitor_session("test-token")
+                self.assertEqual(agent_app.task_exit_code, 0)
+            finally:
+                os.unlink(exit_code_path)
+        finally:
+            agent_app.current_token = original_token
+            agent_app.task_exit_code = original_exit
+
+    async def test_records_exit_code_nonzero_from_file(self):
+        """tmux 会话退出后，应从文件读取非零退出码并设置 task_exit_code = 1"""
+        original_token = agent_app.current_token
+        original_exit = agent_app.task_exit_code
+        try:
+            agent_app.current_token = "test-token"
+            agent_app.task_exit_code = None
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+                f.write("1\n")
+                exit_code_path = f.name
+            try:
+                with patch.object(agent_app, "_tmux_session_exists", return_value=False), \
+                     patch.object(agent_app, "EXIT_CODE_FILE", exit_code_path), \
+                     patch("os.path.isfile", return_value=True):
+                    await agent_app._monitor_session("test-token")
+                self.assertEqual(agent_app.task_exit_code, 1)
+            finally:
+                os.unlink(exit_code_path)
+        finally:
+            agent_app.current_token = original_token
+            agent_app.task_exit_code = original_exit
+
+    async def test_sets_exit_code_1_when_no_exit_code_file(self):
+        """tmux 会话退出但退出码文件不存在时，task_exit_code 应设为 1"""
+        original_token = agent_app.current_token
+        original_exit = agent_app.task_exit_code
+        try:
+            agent_app.current_token = "test-token"
+            agent_app.task_exit_code = None
+            with patch.object(agent_app, "_tmux_session_exists", return_value=False), \
+                 patch("os.path.isfile", return_value=False):
+                await agent_app._monitor_session("test-token")
+            self.assertEqual(agent_app.task_exit_code, 1)
+        finally:
+            agent_app.current_token = original_token
+            agent_app.task_exit_code = original_exit
+
+    async def test_stops_monitoring_when_token_changes(self):
+        """当 current_token 被替换（新任务启动）时，监控应停止"""
+        original_token = agent_app.current_token
+        original_exit = agent_app.task_exit_code
+        try:
+            agent_app.current_token = "old-token"
+            agent_app.task_exit_code = None
+            # 模拟 tmux 会话仍存在，但 current_token 已变更为其他值
+            session_check_count = 0
+
+            def fake_session_exists():
+                nonlocal session_check_count
+                session_check_count += 1
+                # 第一次检查时更改 token，模拟新任务已启动
+                agent_app.current_token = "new-token"
+                return True
+
+            with patch.object(agent_app, "_tmux_session_exists", side_effect=fake_session_exists), \
+                 patch("asyncio.sleep", return_value=None):
+                await agent_app._monitor_session("old-token")
+            # 监控应因 token 不匹配而退出，task_exit_code 不应被修改
+            self.assertIsNone(agent_app.task_exit_code)
+            # 至少执行了一次会话检查
+            self.assertGreaterEqual(session_check_count, 1)
+        finally:
+            agent_app.current_token = original_token
+            agent_app.task_exit_code = original_exit
 
 
 if __name__ == "__main__":

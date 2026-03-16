@@ -50,18 +50,18 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: coding-agent-service:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: 验证镜像启动与 API 健康检查
         run: |
-          docker build -t coding-agent-service:ci .
           docker run --rm -d \
             -p 8000:8000 \
             -e ANTHROPIC_API_KEY=test-key \
             --name coding-agent-ci \
-            coding-agent-service:ci
+            coding-agent-service:${{ github.sha }}
           sleep 5
           # 验证 /docs 端点可访问（HTTP 200）
           curl --retry 5 --retry-delay 2 --retry-connrefused \
