@@ -23,6 +23,10 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # RUN commands and for the final container runtime.
 ENV PATH="/root/.local/bin:${PATH}"
 
+# The official installer places the binary as "claude"; create a "claude-code"
+# symlink so that existing integrations and the app's CLI tool name are honoured.
+RUN ln -s /root/.local/bin/claude /root/.local/bin/claude-code
+
 # ---------------------------------------------------------------------------
 # Install opencode via official npm package (package name: opencode-ai)
 # See: https://www.npmjs.com/package/opencode-ai
