@@ -1,0 +1,21 @@
+# coding-agent-service docker compose 快速启动配置
+# 使用方法：
+#   1. cp .env.sample .env
+#   2. 编辑 .env，填入 LLM API Key 等必要参数
+#   3. docker compose up -d
+
+services:
+  coding-agent:
+    image: ghcr.io/smellgamed3/coding-agent-service:latest
+    container_name: coding-agent
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # 持久化工作区，避免容器重启后克隆的代码丢失（可选）
+      - workspace:/workspace
+    restart: unless-stopped
+
+volumes:
+  workspace:
